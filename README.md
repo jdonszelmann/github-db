@@ -14,3 +14,9 @@ to compute when scraping the data just for that query from Github directly.
 This gathers all information from a repo without consent of contributors to said repository.
 Even if the repository is public, this may be ethically questionable.
 I ask you to use this software responsibly. Please.
+
+## Shout out
+
+This library uses [rust-query](https://github.com/lholten/rust-query), 
+an awesome database library created by a friend of mine.
+Give it a try if you get the chance!
