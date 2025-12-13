@@ -29,8 +29,9 @@ impl RequestLimits {
     pub fn new(limit: usize) -> Self {
         Self {
             global_limit: limit,
-            category_limits: Priority::ALL
-                .map(|i| (0.2 * limit as f64 * i.fraction(), Instant::now())),
+            // category_limits: Priority::ALL
+            // .map(|i| (0.2 * limit as f64 * i.fraction(), Instant::now())),
+            category_limits: Priority::ALL.map(|_| (0.0, Instant::now())),
             saved_up: 0.0,
         }
     }
@@ -69,6 +70,6 @@ impl RequestLimits {
             }
         }
 
-        self.saved_up = saved_up.max(self.global_limit as f64 * 0.2);
+        self.saved_up = saved_up.max(self.global_limit as f64 * 0.2) * 0.5;
     }
 }
