@@ -3,12 +3,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+use itertools::Itertools;
+use ringbuffer::{ConstGenericRingBuffer, RingBuffer};
+
 use crate::requests::Priority;
 
 pub struct RequestLimits {
     global_limit: usize,
     category_limits: [(f64, Instant); Priority::ALL.len()],
     saved_up: f64,
+    measured_rps: ConstGenericRingBuffer<Instant, 4096>,
 }
 
 impl Display for RequestLimits {
@@ -33,7 +37,21 @@ impl RequestLimits {
             // .map(|i| (0.2 * limit as f64 * i.fraction(), Instant::now())),
             category_limits: Priority::ALL.map(|_| (0.0, Instant::now())),
             saved_up: 0.0,
+            measured_rps: ConstGenericRingBuffer::new(),
         }
+    }
+
+    pub fn average_time_between_requests(&self) -> Duration {
+        Duration::from_millis(
+            (self
+                .measured_rps
+                .iter()
+                .tuple_windows()
+                .map(|(prev, curr)| curr.duration_since(*prev))
+                .map(|i| i.as_millis())
+                .sum::<u128>()
+                / self.measured_rps.len().max(1) as u128) as u64,
+        )
     }
 
     pub async fn update(&mut self, next_request: impl AsyncFn(Priority) -> bool) {
@@ -57,6 +75,7 @@ impl RequestLimits {
 
             while *before_count >= 1.0 {
                 if next_request(category).await {
+                    self.measured_rps.enqueue(Instant::now());
                     *before_count -= 1.0;
                 } else {
                     break;
@@ -70,6 +89,6 @@ impl RequestLimits {
             }
         }
 
-        self.saved_up = saved_up.max(self.global_limit as f64 * 0.2) * 0.5;
+        // self.saved_up = saved_up.max(self.global_limit as f64 * 0.2) * 0.5;
     }
 }

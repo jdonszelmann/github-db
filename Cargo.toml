@@ -12,6 +12,8 @@ serde_json = "1"
 tracing = "0.1"
 http = "1"
 chrono = "0.4"
+ringbuffer = "0.16"
+itertools = "0.14"
 
 [dev-dependencies]
 dotenvy = "0.15"

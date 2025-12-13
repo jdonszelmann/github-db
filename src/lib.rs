@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     fmt::Debug,
     future::poll_fn,
     path::Path,
@@ -49,9 +50,14 @@ impl FromStr for Repo {
     }
 }
 
+pub struct GithubCredentials {
+    pub app_id: String,
+    pub app_secret: String,
+}
+
 pub struct GithubDb {
     db: DatabaseAsync<Schema>,
-    octocrab: Octocrab,
+    octocrabs: Mutex<VecDeque<Arc<Octocrab>>>,
 
     limits: Mutex<RequestLimits>,
     request_sequence_number: AtomicI64,
@@ -64,19 +70,20 @@ pub struct GithubDb {
 impl GithubDb {
     pub async fn new(
         db_path: impl AsRef<Path>,
-        github_app_id: impl AsRef<str>,
-        github_app_secret: impl AsRef<str>,
+        credentials: &[GithubCredentials],
         requests_per_hour: usize,
         repos: &[&str],
     ) -> Self {
-        let octocrab = octocrab::Octocrab::builder()
-            // .personal_token(github_app_secret.as_ref().to_string())
-            .basic_auth(
-                github_app_id.as_ref().to_string(),
-                github_app_secret.as_ref().to_string(),
-            )
-            .build()
-            .unwrap();
+        let octocrabs = credentials
+            .iter()
+            .map(|GithubCredentials { app_id, app_secret }| {
+                octocrab::Octocrab::builder()
+                    .basic_auth(app_id.clone(), app_secret.clone())
+                    .build()
+                    .unwrap()
+            })
+            .map(Arc::new)
+            .collect();
         let db = schema::migrate(db_path);
 
         let max_seq_number = db
@@ -93,7 +100,7 @@ impl GithubDb {
 
         let res = Self {
             db,
-            octocrab,
+            octocrabs: Mutex::new(octocrabs),
             repos: repos
                 .iter()
                 .map(|f| {
@@ -110,6 +117,12 @@ impl GithubDb {
         res.startup_requests().await;
 
         res
+    }
+
+    async fn octocrab(&self) -> Arc<Octocrab> {
+        let mut octocrabs = self.octocrabs.lock().await;
+        octocrabs.rotate_left(1);
+        octocrabs.front().unwrap().clone()
     }
 
     async fn startup_requests(&self) {
@@ -236,76 +249,62 @@ impl GithubDb {
             })
             .await;
 
-        tracing::debug!("{}", self.limits.lock().await);
         self.stats().await;
     }
 
     async fn stats(&self) {
-        let num_prs = self
-            .db
-            .transaction(move |txn| {
-                txn.query_one(aggregate(|row| {
-                    use schema::*;
-                    let r = row.join(PullRequest);
-                    row.count_distinct(r)
-                }))
-            })
-            .await;
-        let num_issues = self
-            .db
-            .transaction(move |txn| {
-                txn.query_one(aggregate(|row| {
-                    use schema::*;
-                    let r = row.join(Issue);
-                    row.count_distinct(r)
-                }))
-            })
-            .await;
-        let num_shared = self
-            .db
-            .transaction(move |txn| {
-                txn.query_one(aggregate(|row| {
-                    use schema::*;
-                    let r = row.join(IssuePullRequestShared);
-                    row.count_distinct(r)
-                }))
-            })
-            .await;
-        let num_users = self
-            .db
-            .transaction(move |txn| {
-                txn.query_one(aggregate(|row| {
-                    use schema::*;
-                    let r = row.join(User);
-                    row.count_distinct(r)
-                }))
-            })
-            .await;
-        let num_comments = self
-            .db
-            .transaction(move |txn| {
-                txn.query_one(aggregate(|row| {
-                    use schema::*;
-                    let r = row.join(Comment);
-                    row.count_distinct(r)
-                }))
-            })
-            .await;
+        let (num_prs, num_issues, num_shared, num_users, num_comments, num_labels, num_requests) =
+            self.db
+                .transaction(move |txn| {
+                    (
+                        txn.query_one(aggregate(|row| {
+                            use schema::*;
+                            let r = row.join(PullRequest);
+                            row.count_distinct(r)
+                        })),
+                        txn.query_one(aggregate(|row| {
+                            use schema::*;
+                            let r = row.join(Issue);
+                            row.count_distinct(r)
+                        })),
+                        txn.query_one(aggregate(|row| {
+                            use schema::*;
+                            let r = row.join(IssuePullRequestShared);
+                            row.count_distinct(r)
+                        })),
+                        txn.query_one(aggregate(|row| {
+                            use schema::*;
+                            let r = row.join(User);
+                            row.count_distinct(r)
+                        })),
+                        txn.query_one(aggregate(|row| {
+                            use schema::*;
+                            let r = row.join(Comment);
+                            row.count_distinct(r)
+                        })),
+                        txn.query_one(aggregate(|row| {
+                            use schema::*;
+                            let r = row.join(Label);
+                            row.count_distinct(r)
+                        })),
+                        txn.query_one(aggregate(|row| {
+                            use schema::*;
+                            let r = row.join(Request);
+                            row.count_distinct(r)
+                        })),
+                    )
+                })
+                .await;
 
-        let num_requests = self
-            .db
-            .transaction(move |txn| {
-                txn.query_one(aggregate(|row| {
-                    use schema::*;
-                    let r = row.join(Request);
-                    row.count_distinct(r)
-                }))
-            })
-            .await;
-
+        tracing::info!("{}", self.limits.lock().await);
         tracing::info!(
-            "prs: {num_prs} issues: {num_issues} shared: {num_shared} users: {num_users} comments: {num_comments} pending requests: {num_requests}"
+            "prs: {num_prs} issues: {num_issues} shared: {num_shared} users: {num_users} comments: {num_comments} labels: {num_labels} pending requests: {num_requests}"
         );
+        let avg_time_btwn_req = self.limits.lock().await.average_time_between_requests();
+        let req_per_hour = (3600 * 1000) / avg_time_btwn_req.as_millis().max(1);
+        tracing::info!(
+            "average time between requests: {avg_time_btwn_req:?} i.e. {req_per_hour} req/h"
+        )
     }
 
     async fn next_request(&self, c: Priority) -> Option<Request> {

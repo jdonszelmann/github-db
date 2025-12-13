@@ -37,8 +37,8 @@ impl Priority {
     fn fraction(&self) -> f64 {
         // must add to 1.0
         match self {
-            Priority::Update => 0.3,
-            Priority::Comments => 0.6,
+            Priority::Update => 0.1,
+            Priority::Comments => 0.8,
             Priority::Index => 0.1,
         }
     }

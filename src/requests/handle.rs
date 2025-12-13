@@ -15,7 +15,7 @@ macro_rules! build_request {
                 let page: Result<Page<_>, _> = if let Some(page) = $url
                     && let Ok(i) = Uri::from_str(&page)
                 {
-                    let Some(page) = $_self.octocrab.get_page(&Some(i)).await.transpose() else {
+                    let Some(page) = $_self.octocrab().await.get_page(&Some(i)).await.transpose() else {
                         return;
                     };
                     page
@@ -60,7 +60,8 @@ impl GithubDb {
     ) {
         build_request!(self, url, repo);
         let (items, next) = request!(
-            self.octocrab
+            self.octocrab()
+                .await
                 .pulls(&repo.organization, &repo.name)
                 .list()
                 .sort(octocrab::params::pulls::Sort::Updated)
@@ -68,6 +69,7 @@ impl GithubDb {
                     ListType::New => Direction::Descending,
                     ListType::Old => Direction::Ascending,
                 })
+                .state(octocrab::params::State::All)
                 .page(page_num as u32)
                 .per_page(100)
                 .send()
@@ -118,7 +120,8 @@ impl GithubDb {
     ) {
         build_request!(self, url, repo);
         let (items, next) = request!(
-            self.octocrab
+            self.octocrab()
+                .await
                 .issues(&repo.organization, &repo.name)
                 .list()
                 .sort(octocrab::params::issues::Sort::Updated)
@@ -126,6 +129,7 @@ impl GithubDb {
                     ListType::New => Direction::Descending,
                     ListType::Old => Direction::Ascending,
                 })
+                .state(octocrab::params::State::All)
                 .page(page_num as u32)
                 .per_page(100)
                 .send()
@@ -178,7 +182,8 @@ impl GithubDb {
     ) {
         build_request!(self, url, repo issue_number);
         let (items, next) = request!({
-            let comments = self.octocrab.issues(&repo.organization, &repo.name);
+            let octocrab = self.octocrab().await;
+            let comments = octocrab.issues(&repo.organization, &repo.name);
             let mut comments = comments.list_comments(issue_number);
 
             if let Some(since) = since_timestamp
@@ -210,7 +215,8 @@ impl GithubDb {
     }
 
     pub async fn handle_request(&self, r: Request) {
-        tracing::debug!("handling request {r:?}");
+        tracing::debug!("{r:?}");
+        tracing::info!("handling request {}", r.name());
         match r {
             Request::OldPr { repo, page, url } => {
                 self.handle_list_prs(repo, page, url, ListType::Old).await

@@ -211,9 +211,9 @@ impl GithubDb {
                     }
                 }
 
-                if !matches!(status, ProcessStatus::Unchanged) {
-                    println!("{status:?}");
-                }
+                // if !matches!(status, ProcessStatus::Unchanged) {
+                // println!("{status:?}");
+                // }
                 status
             })
             .await
