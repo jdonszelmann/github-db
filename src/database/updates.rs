@@ -1,10 +1,14 @@
 use chrono::Utc;
-use octocrab::models::{IssueState, issues::Issue, pulls::PullRequest};
+use octocrab::models::{
+    IssueState,
+    issues::{Comment, Issue},
+    pulls::PullRequest,
+};
 use rust_query::{TableRow, Transaction};
 
 use crate::{
     GithubDb, Repo,
-    schema::{self, Schema},
+    database::schema::{self, Schema},
 };
 
 macro_rules! gen_update {
@@ -22,6 +26,55 @@ macro_rules! gen_update {
 }
 
 impl GithubDb {
+    pub async fn process_comment(
+        &self,
+        repo: Repo,
+        Comment {
+            id,
+            node_id: _,
+            url: _,
+            html_url: _,
+            issue_url: _,
+            body,
+            body_text: _,
+            body_html: _,
+            author_association,
+            user,
+            created_at,
+            updated_at,
+            ..
+        }: Comment,
+        issue_number: u64,
+    ) -> ProcessStatus {
+        self.db
+            .transaction_mut_ok(move |txn| {
+                use schema::*;
+                let mut status = ProcessStatus::Unchanged;
+
+                let Some(issue_or_pr) =
+                    txn.query_one(IssuePullRequestShared.number(issue_number as i64))
+                else {
+                    tracing::error!("no issue found in database for comment {}", id);
+                    return status;
+                };
+
+                let author = ensure_user_exists(txn, &mut status, user);
+                ensure_comment_exists(
+                    txn,
+                    &mut status,
+                    *id as i64,
+                    author,
+                    issue_or_pr,
+                    body,
+                    created_at.timestamp(),
+                    updated_at.unwrap_or(created_at).timestamp(),
+                );
+
+                status
+            })
+            .await
+    }
+
     pub async fn process_pr(
         &self,
         repo: Repo,
@@ -157,39 +210,47 @@ impl GithubDb {
             ..
         }: Issue,
     ) -> ProcessStatus {
-        self.db
-            .transaction_mut_ok(move |txn| {
-                use schema::*;
+        let status = self
+            .db
+            .transaction_mut_ok({
+                let repo = repo.clone();
+                move |txn| {
+                    use schema::*;
 
-                let mut status = ProcessStatus::Unchanged;
+                    let mut status = ProcessStatus::Unchanged;
 
-                let user = ensure_user_exists(txn, &mut status, user);
+                    let user = ensure_user_exists(txn, &mut status, user);
 
-                let repo = txn.find_or_insert(Repo {
-                    organization: repo.organization,
-                    name: repo.name,
-                });
-                let closed_at = (state == IssueState::Closed)
-                    .then(|| closed_at.unwrap_or_else(Utc::now).timestamp());
+                    let repo = txn.find_or_insert(Repo {
+                        organization: repo.organization,
+                        name: repo.name,
+                    });
+                    let closed_at = (state == IssueState::Closed)
+                        .then(|| closed_at.unwrap_or_else(Utc::now).timestamp());
 
-                let shared = ensure_shared_exists(
-                    txn,
-                    &mut status,
-                    user,
-                    repo,
-                    number,
-                    Some(title),
-                    body,
-                    created_at.timestamp(),
-                    updated_at.timestamp(),
-                    closed_at,
-                );
+                    let shared = ensure_shared_exists(
+                        txn,
+                        &mut status,
+                        user,
+                        repo,
+                        number,
+                        Some(title),
+                        body,
+                        created_at.timestamp(),
+                        updated_at.timestamp(),
+                        closed_at,
+                    );
 
-                ensure_issue_exists(txn, &mut status, shared);
+                    ensure_issue_exists(txn, &mut status, shared);
 
-                status
+                    status
+                }
             })
-            .await
+            .await;
+
+        self.add_comments_updated_req(status, repo, Some(updated_at.timestamp()), number)
+            .await;
+        status
     }
 }
 
@@ -204,6 +265,45 @@ impl ProcessStatus {
     fn update(&mut self, other: Self) {
         if (other as usize) < (*self as usize) {
             *self = other;
+        }
+    }
+}
+
+fn ensure_comment_exists(
+    txn: &mut Transaction<Schema>,
+    status: &mut ProcessStatus,
+    comment_id: i64,
+    author: TableRow<schema::User>,
+    issue_or_pr: TableRow<schema::IssuePullRequestShared>,
+    text: Option<String>,
+    created_timestamp: i64,
+    updated_timestamp: i64,
+) -> TableRow<schema::Comment> {
+    use crate::schema::*;
+    gen_update!(status);
+
+    match txn.insert(Comment {
+        comment_id,
+        author,
+        text: text.clone().unwrap_or_default(),
+        issue_or_pr,
+        created_timestamp,
+        updated_timestamp,
+    }) {
+        Err(e) => {
+            let mut comment = txn.mutable(e);
+            update!(comment.author, author);
+            if let Some(text) = text {
+                update!(comment.text, text);
+            }
+            // don't issue pr, it can't change (I hope)
+            update!(comment.created_timestamp, created_timestamp);
+            update!(comment.updated_timestamp, updated_timestamp);
+            e
+        }
+        Ok(i) => {
+            status.update(ProcessStatus::New);
+            i
         }
     }
 }
@@ -311,7 +411,7 @@ fn ensure_issue_exists(
     shared: TableRow<schema::IssuePullRequestShared>,
 ) -> TableRow<schema::Issue> {
     use crate::schema::*;
-    gen_update!(status);
+    // gen_update!(status);
 
     match txn.insert(Issue { shared }) {
         Ok(i) => {

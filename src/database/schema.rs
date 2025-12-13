@@ -83,11 +83,16 @@ pub mod vN {
     }
 
     pub struct Comment {
+        #[unique]
+        pub comment_id: i64,
+
         pub author: User,
         pub text: String,
 
-        pub created_unix_timestamp: i64,
-        pub last_updated_timestamp: i64,
+        pub issue_or_pr: IssuePullRequestShared,
+
+        pub created_timestamp: i64,
+        pub updated_timestamp: i64,
     }
 }
 

@@ -1,4 +1,11 @@
-use std::{env, sync::Arc, time::Duration};
+use std::{
+    env,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use github_db::GithubDb;
 use tracing::level_filters::LevelFilter;
@@ -6,6 +13,7 @@ use tracing::level_filters::LevelFilter;
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
+
     tracing_subscriber::fmt()
         .with_target(false)
         .with_timer(tracing_subscriber::fmt::time::uptime())
@@ -24,9 +32,19 @@ async fn main() {
         .await,
     );
 
+    let done = Arc::new(AtomicBool::new(false));
+
     let mut interval = tokio::time::interval(Duration::from_secs(5));
 
-    loop {
+    tokio::spawn({
+        let done = done.clone();
+        async move {
+            tokio::signal::ctrl_c().await.unwrap();
+            done.store(true, Ordering::Relaxed);
+        }
+    });
+
+    while !done.load(Ordering::Relaxed) {
         interval.tick().await;
         gh.clone().update().await;
     }
