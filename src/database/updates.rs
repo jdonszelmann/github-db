@@ -118,7 +118,7 @@ impl GithubDb {
             assignee,
             assignees,
             requested_reviewers,
-            requested_teams,
+            requested_teams: _,
             rebaseable,
             head,
             base,
@@ -177,7 +177,7 @@ impl GithubDb {
                     author_association,
                 );
 
-                ensure_pr_exists(
+                let pr = ensure_pr_exists(
                     txn,
                     &mut status,
                     shared,
@@ -213,6 +213,14 @@ impl GithubDb {
                 let outdated_assignments =
                     update_assignments(txn, &mut status, shared, assigned_users);
 
+                let review_requested_users: Vec<_> = requested_reviewers
+                    .into_iter()
+                    .flatten()
+                    .map(|user| ensure_user_exists(txn, &mut status, user))
+                    .collect();
+                let outdated_review_requests =
+                    update_review_requests(txn, &mut status, pr, review_requested_users);
+
                 let txn = txn.downgrade();
                 for i in outdated_assignments {
                     if let Err(()) = txn.delete(i) {
@@ -222,6 +230,11 @@ impl GithubDb {
                 for i in outdated_labels {
                     if let Err(()) = txn.delete(i) {
                         tracing::error!("label assignment {i:?} referenced somehow");
+                    }
+                }
+                for i in outdated_review_requests {
+                    if let Err(()) = txn.delete(i) {
+                        tracing::error!("review request {i:?} referenced somehow");
                     }
                 }
 
@@ -537,6 +550,51 @@ fn ensure_shared_exists(
             e
         }
     }
+}
+
+fn update_review_requests(
+    txn: &mut Transaction<Schema>,
+    status: &mut ProcessStatus,
+    pr: TableRow<schema::PullRequest>,
+    users: Vec<TableRow<schema::User>>,
+) -> Vec<TableRow<schema::ReviewRequest>> {
+    use crate::schema::*;
+    gen_update!(status);
+
+    let assignments_for_shared = txn.query(|rows| {
+        let assignments = rows.join(ReviewRequest);
+        rows.filter(assignments.pr.eq(pr));
+        rows.into_vec(assignments)
+    });
+
+    for i in assignments_for_shared {
+        txn.mutable(i).outdated = 1;
+    }
+
+    for user in users {
+        match txn.insert(ReviewRequest {
+            user,
+            pr,
+            outdated: 0,
+        }) {
+            Ok(i) => {
+                status.update(ProcessStatus::New);
+                i
+            }
+            Err(e) => {
+                let mut assignment = txn.mutable(e);
+                update!(assignment.outdated, 0);
+                e
+            }
+        };
+    }
+
+    txn.query(|rows| {
+        let assignments = rows.join(ReviewRequest);
+        rows.filter(assignments.pr.eq(pr));
+        rows.filter(assignments.outdated.eq(1));
+        rows.into_vec(assignments)
+    })
 }
 
 fn update_assignments(

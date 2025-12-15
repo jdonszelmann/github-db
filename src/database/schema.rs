@@ -7,8 +7,9 @@ use rust_query::{
 };
 
 #[schema(Schema)]
-#[version(0..=1)]
+#[version(0..=2)]
 pub mod vN {
+
     pub struct Config {
         #[unique]
         pub key: String,
@@ -76,6 +77,14 @@ pub mod vN {
     pub struct Assignment {
         pub user: User,
         pub issue_or_pr: IssuePullRequestShared,
+        pub outdated: i64,
+    }
+
+    #[unique(user, pr)]
+    #[version(2..)]
+    pub struct ReviewRequest {
+        pub user: User,
+        pub pr: PullRequest,
         pub outdated: i64,
     }
 
@@ -162,9 +171,9 @@ pub mod vN {
     }
 }
 
-pub use v1::*;
+pub use v2::*;
 
-pub fn migrate(db_path: impl AsRef<Path>) -> DatabaseAsync<v1::Schema> {
+pub fn migrate(db_path: impl AsRef<Path>) -> DatabaseAsync<v2::Schema> {
     let m = Database::migrator(Config::open(db_path))
         .expect("database should not be older than supported versions");
 
@@ -188,6 +197,8 @@ pub fn migrate(db_path: impl AsRef<Path>) -> DatabaseAsync<v1::Schema> {
             mergeable_state: MergeableState::Unknown as i64,
         }),
     });
+
+    let m = m.migrate(|_txn| v1::migrate::Schema {});
 
     let db = m
         .finish()
