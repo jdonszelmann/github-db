@@ -10,20 +10,19 @@ use std::{
 };
 
 use octocrab::Octocrab;
-use rust_query::{DatabaseAsync, aggregate};
+use rust_query::{DatabaseAsync, Transaction, aggregate};
 use serde::{Deserialize, Serialize};
 use tokio::{sync::Mutex, task, time::interval};
 
 use crate::{
-    database::{
-        schema::{self, Schema},
-        updates::ProcessStatus,
-    },
+    database::{schema::Schema, updates::ProcessStatus},
     requests::{Priority, Request, limits::RequestLimits},
 };
 
 mod database;
 mod requests;
+
+pub use crate::database::schema;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Repo {
@@ -123,6 +122,13 @@ impl GithubDb {
         let mut octocrabs = self.octocrabs.lock().await;
         octocrabs.rotate_left(1);
         octocrabs.front().unwrap().clone()
+    }
+
+    pub async fn transaction<R: 'static + Send>(
+        &self,
+        f: impl 'static + Send + FnOnce(&'static Transaction<Schema>) -> R,
+    ) -> R {
+        self.db.transaction(f).await
     }
 
     async fn startup_requests(&self) {
