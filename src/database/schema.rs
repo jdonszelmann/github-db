@@ -1,12 +1,13 @@
 use std::{path::Path, sync::Arc};
 
+use octocrab::models::pulls::MergeableState;
 use rust_query::{
-    Database, DatabaseAsync,
+    Database, DatabaseAsync, Lazy,
     migration::{Config, schema},
 };
 
 #[schema(Schema)]
-#[version(0..=0)]
+#[version(0..=1)]
 pub mod vN {
     pub struct Config {
         #[unique]
@@ -45,10 +46,28 @@ pub mod vN {
 
         pub created_timestamp: i64,
         pub updated_timestamp: i64,
-        pub closed_at_timestamp: Option<i64>,
 
-        // bool
+        /// Discriminant of octocrab::models::issues::StateReason,
+        /// None if no particular reason
+        #[version(1..)]
+        pub state_reason: Option<i64>,
+
+        /// None if not closed
+        pub closed_at_timestamp: Option<i64>,
+        /// None if not closed
+        #[version(1..)]
+        pub closed_by: Option<User>,
+
+        /// Discriminant of octocrab::models::AuthorAssociation
+        #[version(1..)]
+        pub author_association: String,
+
+        #[version(..1)]
         pub locked: i64,
+
+        /// None if not locked, Some(empty string) if locked without reason
+        #[version(1..)]
+        pub lock_reason: Option<String>,
 
         pub repo: Repo,
     }
@@ -63,15 +82,43 @@ pub mod vN {
     pub struct PullRequest {
         #[unique]
         pub shared: IssuePullRequestShared,
-        // bool
+        /// bool
         pub draft: i64,
-        // bool
+        /// bool
         pub maintainer_can_modify: i64,
 
         pub num_additions: i64,
         pub num_deletions: i64,
         pub num_changed_files: i64,
         pub num_commits: i64,
+
+        /// none if not merged
+        #[version(1..)]
+        pub merged_at_timestamp: Option<i64>,
+        /// none if not merged
+        #[version(1..)]
+        pub merge_commit_sha: Option<String>,
+        /// none if not merged
+        #[version(1..)]
+        pub merged_by: Option<User>,
+
+        /// Only none in old database versions, is supposed to always be there
+        #[version(1..)]
+        pub head_sha: Option<String>,
+        /// Only none in old database versions, is supposed to always be there
+        #[version(1..)]
+        pub base_sha: Option<String>,
+
+        /// Discriminant of octocrab::models::pulls::MergeableState
+        #[version(1..)]
+        pub mergeable_state: i64,
+
+        /// bool
+        #[version(1..)]
+        pub mergeable: i64,
+        /// bool
+        #[version(1..)]
+        pub rebaseable: i64,
     }
 
     pub struct Issue {
@@ -83,7 +130,8 @@ pub mod vN {
     pub struct IssuePrLink {
         pub from: IssuePullRequestShared,
         pub to: IssuePullRequestShared,
-        pub pr_closes_issue: i64, // boolean
+        /// bool
+        pub pr_closes_issue: i64,
     }
 
     #[unique(issue_or_pr, label)]
@@ -114,11 +162,32 @@ pub mod vN {
     }
 }
 
-pub use v0::*;
+pub use v1::*;
 
-pub fn migrate(db_path: impl AsRef<Path>) -> DatabaseAsync<v0::Schema> {
+pub fn migrate(db_path: impl AsRef<Path>) -> DatabaseAsync<v1::Schema> {
     let m = Database::migrator(Config::open(db_path))
         .expect("database should not be older than supported versions");
+
+    let m = m.migrate(|txn| v0::migrate::Schema {
+        issue_pull_request_shared: txn.migrate_ok(|old: Lazy<v0::IssuePullRequestShared>| {
+            v0::migrate::IssuePullRequestShared {
+                state_reason: None,
+                closed_by: None,
+                author_association: "Unknown".to_string(),
+                lock_reason: (old.locked == 1).then_some("".to_string()),
+            }
+        }),
+        pull_request: txn.migrate_ok(|_: Lazy<v0::PullRequest>| v0::migrate::PullRequest {
+            merged_at_timestamp: None,
+            merge_commit_sha: None,
+            merged_by: None,
+            head_sha: None,
+            base_sha: None,
+            mergeable: 0,
+            rebaseable: 0,
+            mergeable_state: MergeableState::Unknown as i64,
+        }),
+    });
 
     let db = m
         .finish()

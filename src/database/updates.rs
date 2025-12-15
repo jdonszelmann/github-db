@@ -1,8 +1,8 @@
 use chrono::Utc;
 use octocrab::models::{
-    IssueState, Label,
-    issues::{Comment, Issue},
-    pulls::PullRequest,
+    AuthorAssociation, IssueState, Label,
+    issues::{Comment, Issue, IssueStateReason},
+    pulls::{MergeableState, PullRequest},
 };
 use rust_query::{TableRow, Transaction};
 
@@ -111,7 +111,7 @@ impl GithubDb {
             closed_at,
             mergeable,
             mergeable_state,
-            merged,
+            merged: _,
             merged_at,
             merged_by,
             merge_commit_sha,
@@ -154,6 +154,9 @@ impl GithubDb {
                 });
                 let closed_at = (state == Some(IssueState::Closed))
                     .then(|| closed_at.unwrap_or_else(Utc::now).timestamp());
+
+                let closed_by = merged_by.map(|user| ensure_user_exists(txn, &mut status, *user));
+
                 let shared = ensure_shared_exists(
                     &mut *txn,
                     &mut status,
@@ -162,13 +165,16 @@ impl GithubDb {
                     number,
                     title,
                     body,
-                    locked,
+                    locked.then_some(active_lock_reason).flatten(),
                     created_at.unwrap_or_else(Utc::now).timestamp(),
                     updated_at
                         .or(created_at)
                         .unwrap_or_else(Utc::now)
                         .timestamp(),
                     closed_at,
+                    None,
+                    closed_by,
+                    author_association,
                 );
 
                 ensure_pr_exists(
@@ -181,6 +187,14 @@ impl GithubDb {
                     deletions.unwrap_or_default() as i64,
                     changed_files.unwrap_or_default() as i64,
                     commits.unwrap_or_default() as i64,
+                    merged_at.map(|i| i.timestamp()),
+                    merge_commit_sha,
+                    closed_by,
+                    head.sha,
+                    base.sha,
+                    mergeable.unwrap_or(false),
+                    rebaseable.unwrap_or(false),
+                    mergeable_state.unwrap_or(MergeableState::Unknown),
                 );
 
                 let labels: Vec<_> = labels
@@ -211,9 +225,6 @@ impl GithubDb {
                     }
                 }
 
-                // if !matches!(status, ProcessStatus::Unchanged) {
-                // println!("{status:?}");
-                // }
                 status
             })
             .await
@@ -242,7 +253,7 @@ impl GithubDb {
             labels,
             assignee: _,
             assignees,
-            author_association: _,
+            author_association,
             milestone: _,
             locked,
             active_lock_reason,
@@ -273,6 +284,9 @@ impl GithubDb {
                     let closed_at = (state == IssueState::Closed)
                         .then(|| closed_at.unwrap_or_else(Utc::now).timestamp());
 
+                    let closed_by =
+                        closed_by.map(|user| ensure_user_exists(txn, &mut status, user));
+
                     let shared = ensure_shared_exists(
                         txn,
                         &mut status,
@@ -281,10 +295,13 @@ impl GithubDb {
                         number,
                         Some(title),
                         body,
-                        locked,
+                        locked.then_some(active_lock_reason).flatten(),
                         created_at.timestamp(),
                         updated_at.timestamp(),
                         closed_at,
+                        state_reason,
+                        closed_by,
+                        author_association,
                     );
 
                     ensure_issue_exists(txn, &mut status, shared);
@@ -453,24 +470,46 @@ fn ensure_shared_exists(
     number: u64,
     title: Option<String>,
     body: Option<String>,
-    locked: bool,
+    lock_reason: Option<String>,
     created_timestamp: i64,
     updated_timestamp: i64,
     closed_at_timestamp: Option<i64>,
+    state_reason: Option<IssueStateReason>,
+    closed_by: Option<TableRow<schema::User>>,
+    author_association: Option<AuthorAssociation>,
 ) -> TableRow<schema::IssuePullRequestShared> {
     use crate::schema::*;
     gen_update!(status);
+
+    let state_reason = state_reason.map(|i| i as i64);
+
+    let association_given = author_association.is_some();
+    let author_association = match author_association.unwrap_or(AuthorAssociation::None) {
+        AuthorAssociation::Collaborator => "Collaborator".to_string(),
+        AuthorAssociation::Contributor => "Contributor".to_string(),
+        AuthorAssociation::FirstTimer => "FirstTimer".to_string(),
+        AuthorAssociation::FirstTimeContributor => "FirstTimeContributor".to_string(),
+        AuthorAssociation::Mannequin => "Mannequin".to_string(),
+        AuthorAssociation::Member => "Member".to_string(),
+        AuthorAssociation::None => "None".to_string(),
+        AuthorAssociation::Owner => "Owner".to_string(),
+        AuthorAssociation::Other(o) => o,
+        _ => "Unknown".to_string(),
+    };
 
     match txn.insert(IssuePullRequestShared {
         number: number as i64,
         title: title.clone().unwrap_or_default(),
         description: body.clone().unwrap_or_default(),
         author: user,
-        locked: locked as i64,
+        lock_reason: lock_reason.clone(),
         created_timestamp,
         updated_timestamp,
         closed_at_timestamp,
         repo,
+        state_reason,
+        closed_by,
+        author_association: author_association.clone(),
     }) {
         Ok(i) => {
             status.update(ProcessStatus::New);
@@ -484,11 +523,17 @@ fn ensure_shared_exists(
             if let Some(body) = body {
                 update!(shared.description, body);
             }
-            update!(shared.locked, locked as i64);
+            update!(shared.lock_reason, lock_reason);
             update!(shared.author, user);
             update!(shared.created_timestamp, created_timestamp);
             update!(tracked: shared.updated_timestamp, updated_timestamp);
             update!(shared.closed_at_timestamp, closed_at_timestamp);
+            update!(shared.state_reason, state_reason);
+            update!(shared.closed_by, closed_by);
+
+            if association_given {
+                update!(shared.author_association, author_association);
+            }
             e
         }
     }
@@ -594,6 +639,14 @@ fn ensure_pr_exists(
     num_deletions: i64,
     num_changed_files: i64,
     num_commits: i64,
+    merged_at_timestamp: Option<i64>,
+    merge_commit_sha: Option<String>,
+    merged_by: Option<TableRow<schema::User>>,
+    head_sha: String,
+    base_sha: String,
+    mergeable: bool,
+    rebaseable: bool,
+    mergeable_state: MergeableState,
 ) -> TableRow<schema::PullRequest> {
     use crate::schema::*;
     gen_update!(status);
@@ -605,6 +658,14 @@ fn ensure_pr_exists(
         num_deletions,
         num_changed_files,
         num_commits,
+        merged_at_timestamp: merged_at_timestamp,
+        merge_commit_sha: merge_commit_sha.clone(),
+        merged_by: merged_by,
+        head_sha: Some(head_sha.clone()),
+        base_sha: Some(base_sha.clone()),
+        mergeable: mergeable as i64,
+        rebaseable: rebaseable as i64,
+        mergeable_state: mergeable_state.clone() as i64,
     }) {
         Ok(i) => {
             status.update(ProcessStatus::New);
@@ -618,6 +679,14 @@ fn ensure_pr_exists(
             update!(pr.num_deletions, num_deletions);
             update!(pr.num_changed_files, num_changed_files);
             update!(pr.num_commits, num_commits);
+            update!(pr.merged_at_timestamp, merged_at_timestamp);
+            update!(pr.merge_commit_sha, merge_commit_sha);
+            update!(pr.merged_by, merged_by);
+            update!(pr.head_sha, Some(head_sha));
+            update!(pr.base_sha, Some(base_sha));
+            update!(pr.mergeable, mergeable as i64);
+            update!(pr.rebaseable, rebaseable as i64);
+            update!(pr.mergeable_state, mergeable_state as i64);
             e
         }
     }
