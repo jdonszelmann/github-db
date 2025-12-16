@@ -131,6 +131,13 @@ impl GithubDb {
         self.db.transaction(f).await
     }
 
+    pub async fn transaction_mut<R: 'static + Send>(
+        &self,
+        f: impl 'static + Send + FnOnce(&'static mut Transaction<Schema>) -> R,
+    ) -> R {
+        self.db.transaction_mut_ok(f).await
+    }
+
     async fn startup_requests(&self) {
         for repo in &self.repos {
             let oldpr = Request::OldPr {
