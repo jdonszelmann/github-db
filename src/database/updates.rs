@@ -562,8 +562,7 @@ fn update_review_requests(
     gen_update!(status);
 
     let assignments_for_shared = txn.query(|rows| {
-        let assignments = rows.join(ReviewRequest);
-        rows.filter(assignments.pr.eq(pr));
+        let assignments = rows.join(ReviewRequest.pr(pr));
         rows.into_vec(assignments)
     });
 
@@ -590,8 +589,7 @@ fn update_review_requests(
     }
 
     txn.query(|rows| {
-        let assignments = rows.join(ReviewRequest);
-        rows.filter(assignments.pr.eq(pr));
+        let assignments = rows.join(ReviewRequest.pr(pr));
         rows.filter(assignments.outdated.eq(1));
         rows.into_vec(assignments)
     })
