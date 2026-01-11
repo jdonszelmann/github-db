@@ -171,7 +171,7 @@ pub mod vN {
 pub use v2::*;
 
 pub fn migrate(db_path: impl AsRef<Path>) -> DatabaseAsync<v2::Schema> {
-    let m = Database::migrator(rust_query::Config::open(db_path))
+    let m = Database::migrator(rust_query::migration::Config::open(db_path))
         .expect("database should not be older than supported versions");
 
     let m = m.migrate(|txn| v0::migrate::Schema {

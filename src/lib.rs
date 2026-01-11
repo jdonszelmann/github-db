@@ -23,6 +23,7 @@ mod database;
 mod requests;
 
 pub use crate::database::schema;
+pub use rust_query;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Repo {
