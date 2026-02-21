@@ -77,7 +77,7 @@ pub mod vN {
         pub outdated: i64,
     }
 
-    #[unique(user, pr)]
+    #[unique(pr, user)]
     #[version(2..)]
     pub struct ReviewRequest {
         pub user: User,
